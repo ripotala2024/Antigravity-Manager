@@ -113,7 +113,10 @@ pub async fn handle_messages(
         let config = crate::proxy::mappers::common_utils::resolve_request_config(&request_for_body.model, &mapped_model, &tools_val);
 
         // 4. 获取 Token (使用准确的 request_type)
-        let (access_token, project_id, email) = match token_manager.get_token(&config.request_type, false).await {
+        // 关键：在重试尝试 (attempt > 0) 时，必须根据错误类型决定是否强制轮换账号
+        let force_rotate_token = attempt > 0; 
+        
+        let (access_token, project_id, email) = match token_manager.get_token(&config.request_type, force_rotate_token).await {
             Ok(t) => t,
             Err(e) => {
                  return (

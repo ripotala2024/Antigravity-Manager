@@ -46,15 +46,15 @@ pub fn transform_claude_request_in(
     let config = crate::proxy::mappers::common_utils::resolve_request_config(&claude_req.model, &mapped_model, &tools_val);
     // Only Gemini models support our "dummy thought" workaround.
     // Claude models routed via Vertex/Google API often require valid thought signatures.
-    // [FIX] If thinking is enabled and we are routing via v1internal (Vertex), 
-    // we should allow dummy thought to satisfy API requirements.
+    // [FIX] Whenever thinking is enabled, we MUST allow dummy thought injection to satisfy 
+    // Google's strict validation of historical messages, even for non-agent (e.g. search) tasks.
     let is_thinking_enabled = claude_req
         .thinking
         .as_ref()
         .map(|t| t.type_ == "enabled")
         .unwrap_or(false);
 
-    let allow_dummy_thought = config.request_type == "agent" && is_thinking_enabled;
+    let allow_dummy_thought = is_thinking_enabled;
 
     // 4. Generation Config & Thinking
     let generation_config = build_generation_config(claude_req, has_web_search_tool);
@@ -612,13 +612,13 @@ mod tests {
         assert!(schema["properties"]["unit"].get("default").is_none());
         assert!(schema["properties"]["date"].get("format").is_none());
 
-        // Check union type handling ["string", "null"] -> "STRING"
-        assert_eq!(schema["properties"]["unit"]["type"], "STRING");
+        // Check union type handling ["string", "null"] -> "string"
+        assert_eq!(schema["properties"]["unit"]["type"], "string");
 
-        // Check types are uppercased
-        assert_eq!(schema["type"], "OBJECT");
-        assert_eq!(schema["properties"]["location"]["type"], "STRING");
-        assert_eq!(schema["properties"]["date"]["type"], "STRING");
+        // Check types are lowercased
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["location"]["type"], "string");
+        assert_eq!(schema["properties"]["date"]["type"], "string");
     }
 
     #[test]
@@ -632,12 +632,15 @@ mod tests {
                 },
                 Message {
                     role: "assistant".to_string(),
+                    content: MessageContent::Array(vec![
                         ContentBlock::ToolUse {
                             id: "call_1".to_string(),
                             name: "run_command".to_string(),
                             input: json!({"command": "ls"}),
                             signature: None,
+                            cache_control: None,
                         }
+                    ]),
                 },
                 Message {
                     role: "user".to_string(),
