@@ -17,8 +17,6 @@ use crate::proxy::mappers::claude::{
 };
 use crate::proxy::server::AppState;
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
-
 /// 处理 Claude messages 请求
 /// 
 /// 处理 Chat 消息请求流程
@@ -92,7 +90,7 @@ pub async fn handle_messages(
     let token_manager = state.token_manager;
     
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    let max_attempts = pool_size.max(1);  // 允许尝试所有账号，确保配额耗尽时能切换
 
     let mut last_error = String::new();
     let mut retried_without_thinking = false;
@@ -417,12 +415,7 @@ pub async fn handle_messages(
 
         // 只有 429 (限流), 403 (权限/地区限制) 和 401 (认证失效) 触发账号轮换
         if status_code == 429 || status_code == 403 || status_code == 401 {
-            // 如果是 429 且标记为配额耗尽（明确），直接报错，避免穿透整个账号池
-            if status_code == 429 && error_text.contains("QUOTA_EXHAUSTED") {
-                error!("Claude Quota exhausted (429) on attempt {}/{}, stopping to protect pool.", attempt + 1, max_attempts);
-                return (status, error_text).into_response();
-            }
-
+            // 配额耗尽 (QUOTA_EXHAUSTED) 也继续轮换，直到所有账号都尝试过
             tracing::warn!("Claude Upstream {} on attempt {}/{}, rotating account", status, attempt + 1, max_attempts);
             continue;
         }
