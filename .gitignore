@@ -37,3 +37,4 @@ environment/
 
 # Reference projects (for development only)
 
+.specstory/

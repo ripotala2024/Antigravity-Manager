@@ -454,14 +454,17 @@ pub async fn handle_messages(
     debug!("[{}] Message Count: {}", trace_id, request.messages.len());
     debug!("[{}] Has Tools: {}", trace_id, request.tools.is_some());
     debug!("[{}] Has Thinking Config: {}", trace_id, request.thinking.is_some());
-    debug!("[{}] Content Preview: {:.100}...", trace_id, latest_msg);
+    let safe_preview: String = latest_msg.chars().take(100).collect();
+    debug!("[{}] Content Preview: {}...", trace_id, safe_preview);
     
     // 输出每一条消息的详细信息
     for (idx, msg) in request.messages.iter().enumerate() {
         let content_preview = match &msg.content {
             crate::proxy::mappers::claude::models::MessageContent::String(s) => {
-                if s.len() > 200 {
-                    format!("{}... (total {} chars)", &s[..200], s.len())
+                let char_count = s.chars().count();
+                if char_count > 200 {
+                    let preview: String = s.chars().take(200).collect();
+                    format!("{}... (total {} chars)", preview, char_count)
                 } else {
                     s.clone()
                 }
@@ -665,6 +668,9 @@ pub async fn handle_messages(
         
         // 成功
         if status.is_success() {
+            // [智能限流] 请求成功，重置该账号的连续失败计数
+            token_manager.mark_account_success(&email);
+            
             // 处理流式响应
             if request.stream {
                 let stream = response.bytes_stream();
@@ -749,9 +755,9 @@ pub async fn handle_messages(
         last_error = format!("HTTP {}: {}", status_code, error_text);
         debug!("[{}] Upstream Error Response: {}", trace_id, error_text);
         
-        // 3. 标记限流状态（用于 UI 显示）
+        // 3. 标记限流状态（用于 UI 显示）- 使用异步版本以支持实时配额刷新
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
-            token_manager.mark_rate_limited(&email, status_code, retry_after.as_deref(), &error_text);
+            token_manager.mark_rate_limited_async(&email, status_code, retry_after.as_deref(), &error_text).await;
         }
 
         // 4. 处理 400 错误 (Thinking 签名失效)

@@ -9,6 +9,8 @@ pub enum RateLimitReason {
     QuotaExhausted,
     /// 速率限制 (RATE_LIMIT_EXCEEDED)
     RateLimitExceeded,
+    /// 模型容量耗尽 (MODEL_CAPACITY_EXHAUSTED) - 服务端暂时无可用实例
+    ModelCapacityExhausted,
     /// 服务器错误 (5xx)
     ServerError,
     /// 未知原因
@@ -33,12 +35,15 @@ pub struct RateLimitInfo {
 /// 限流跟踪器
 pub struct RateLimitTracker {
     limits: DashMap<String, RateLimitInfo>,
+    /// 连续失败计数器（用于智能限流/指数退避）
+    failure_counts: DashMap<String, u32>,
 }
 
 impl RateLimitTracker {
     pub fn new() -> Self {
         Self {
             limits: DashMap::new(),
+            failure_counts: DashMap::new(),
         }
     }
     
@@ -51,6 +56,67 @@ impl RateLimitTracker {
             }
         }
         0
+    }
+    
+    /// 标记账号请求成功，重置连续失败计数
+    /// 
+    /// 当账号成功完成请求后调用此方法，将其失败计数归零，
+    /// 这样下次失败时会从最短的锁定时间（60秒）开始。
+    pub fn mark_success(&self, account_id: &str) {
+        if self.failure_counts.remove(account_id).is_some() {
+            tracing::debug!("账号 {} 请求成功，已重置失败计数", account_id);
+        }
+        // 同时清除限流记录（如果有）
+        self.limits.remove(account_id);
+    }
+    
+    /// 精确锁定账号到指定时间点
+    /// 
+    /// 使用账号配额中的 reset_time 来精确锁定账号，
+    /// 这比指数退避更加精准。
+    pub fn set_lockout_until(&self, account_id: &str, reset_time: SystemTime, reason: RateLimitReason) {
+        let now = SystemTime::now();
+        let retry_sec = reset_time
+            .duration_since(now)
+            .map(|d| d.as_secs())
+            .unwrap_or(60); // 如果时间已过，使用默认 60 秒
+        
+        let info = RateLimitInfo {
+            reset_time,
+            retry_after_sec: retry_sec,
+            detected_at: now,
+            reason,
+        };
+        
+        self.limits.insert(account_id.to_string(), info);
+        
+        tracing::info!(
+            "账号 {} 已精确锁定到配额刷新时间，剩余 {} 秒",
+            account_id,
+            retry_sec
+        );
+    }
+    
+    /// 使用 ISO 8601 时间字符串精确锁定账号
+    /// 
+    /// 解析类似 "2026-01-08T17:00:00Z" 格式的时间字符串
+    pub fn set_lockout_until_iso(&self, account_id: &str, reset_time_str: &str, reason: RateLimitReason) -> bool {
+        // 尝试解析 ISO 8601 格式
+        match chrono::DateTime::parse_from_rfc3339(reset_time_str) {
+            Ok(dt) => {
+                let reset_time = SystemTime::UNIX_EPOCH + 
+                    std::time::Duration::from_secs(dt.timestamp() as u64);
+                self.set_lockout_until(account_id, reset_time, reason);
+                true
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "无法解析配额刷新时间 '{}': {}，将使用默认退避策略",
+                    reset_time_str, e
+                );
+                false
+            }
+        }
     }
     
     /// 从错误响应解析限流信息
@@ -74,6 +140,7 @@ impl RateLimitTracker {
         
         // 1. 解析限流原因类型
         let reason = if status == 429 {
+            tracing::warn!("Google 429 Error Body: {}", body);
             self.parse_rate_limit_reason(body)
         } else {
             RateLimitReason::ServerError
@@ -100,16 +167,47 @@ impl RateLimitTracker {
                 if s < 2 { 2 } else { s }
             },
             None => {
+                // 获取连续失败次数，用于指数退避
+                let failure_count = {
+                    let mut count = self.failure_counts.entry(account_id.to_string()).or_insert(0);
+                    *count += 1;
+                    *count
+                };
+                
                 match reason {
                     RateLimitReason::QuotaExhausted => {
-                        // 配额耗尽：使用较长的默认值（1小时），避免频繁重试
-                        tracing::warn!("检测到配额耗尽 (QUOTA_EXHAUSTED)，使用默认值 3600秒 (1小时)");
-                        3600
+                        // [智能限流] 根据连续失败次数动态调整锁定时间
+                        // 第1次: 60s, 第2次: 5min, 第3次: 30min, 第4次+: 2h
+                        let lockout = match failure_count {
+                            1 => {
+                                tracing::warn!("检测到配额耗尽 (QUOTA_EXHAUSTED)，第1次失败，锁定 60秒");
+                                60
+                            },
+                            2 => {
+                                tracing::warn!("检测到配额耗尽 (QUOTA_EXHAUSTED)，第2次连续失败，锁定 5分钟");
+                                300
+                            },
+                            3 => {
+                                tracing::warn!("检测到配额耗尽 (QUOTA_EXHAUSTED)，第3次连续失败，锁定 30分钟");
+                                1800
+                            },
+                            _ => {
+                                tracing::warn!("检测到配额耗尽 (QUOTA_EXHAUSTED)，第{}次连续失败，锁定 2小时", failure_count);
+                                7200
+                            }
+                        };
+                        lockout
                     },
                     RateLimitReason::RateLimitExceeded => {
-                        // 速率限制：使用较短的默认值（30秒），可以较快恢复
+                        // 速率限制：通常是短暂的，使用较短的默认值（30秒）
                         tracing::debug!("检测到速率限制 (RATE_LIMIT_EXCEEDED)，使用默认值 30秒");
                         30
+                    },
+                    RateLimitReason::ModelCapacityExhausted => {
+                        // 模型容量耗尽：服务端暂时无可用 GPU 实例
+                        // 这是临时性问题，使用较短的重试时间（15秒）
+                        tracing::warn!("检测到模型容量不足 (MODEL_CAPACITY_EXHAUSTED)，服务端暂无可用实例，15秒后重试");
+                        15
                     },
                     RateLimitReason::ServerError => {
                         // 服务器错误：执行"软避让"，默认锁定 20 秒
@@ -162,17 +260,29 @@ impl RateLimitTracker {
                     return match reason_str {
                         "QUOTA_EXHAUSTED" => RateLimitReason::QuotaExhausted,
                         "RATE_LIMIT_EXCEEDED" => RateLimitReason::RateLimitExceeded,
+                        "MODEL_CAPACITY_EXHAUSTED" => RateLimitReason::ModelCapacityExhausted,
                         _ => RateLimitReason::Unknown,
                     };
                 }
+                // [NEW] 尝试从 message 字段进行文本匹配（防止 missed reason）
+                 if let Some(msg) = json.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str()) {
+                    let msg_lower = msg.to_lowercase();
+                    if msg_lower.contains("per minute") || msg_lower.contains("rate limit") {
+                        return RateLimitReason::RateLimitExceeded;
+                    }
+                 }
             }
         }
         
         // 如果无法从 JSON 解析，尝试从消息文本判断
-        if body.contains("exhausted") || body.contains("quota") {
+        let body_lower = body.to_lowercase();
+        // [FIX] 优先判断分钟级限制，避免将 TPM 误判为 Quota
+        if body_lower.contains("per minute") || body_lower.contains("rate limit") || body_lower.contains("too many requests") {
+             RateLimitReason::RateLimitExceeded
+        } else if body_lower.contains("exhausted") || body_lower.contains("quota") {
             RateLimitReason::QuotaExhausted
-        } else if body.contains("rate limit") || body.contains("too many requests") {
-            RateLimitReason::RateLimitExceeded
         } else {
             RateLimitReason::Unknown
         }
@@ -420,6 +530,19 @@ mod tests {
     }
 
     #[test]
+    fn test_tpm_exhausted_is_rate_limit_exceeded() {
+        let tracker = RateLimitTracker::new();
+        // 模拟真实世界的 TPM 错误，同时包含 "Resource exhausted" 和 "per minute"
+        let body = "Resouce has been exhausted (e.g. check quota). Quota limit 'Tokens per minute' exceeded.";
+        
+        let info = tracker.parse_from_error("acc_tpm", 429, None, body).unwrap();
+        
+        // 期望：被判定为 RateLimitExceeded (30s)，而不是 QuotaExhausted (60s/3600s)
+        assert_eq!(info.reason, RateLimitReason::RateLimitExceeded);
+        assert_eq!(info.retry_after_sec, 30);
+    }
+
+    #[test]
     fn test_safety_buffer() {
         let tracker = RateLimitTracker::new();
         // 如果 API 返回 1s，我们强制设为 2s
@@ -427,5 +550,88 @@ mod tests {
         let wait = tracker.get_remaining_wait("acc1");
         // Due to time passing, it might be 1 or 2
         assert!(wait >= 1 && wait <= 2);
+    }
+
+    #[test]
+    fn test_model_capacity_exhausted() {
+        let tracker = RateLimitTracker::new();
+        // 模拟 Google 服务端模型容量不足的错误
+        let body = r#"{
+            "error": {
+                "code": 429,
+                "message": "No capacity available for model claude-opus-4-5-thinking on the server",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "MODEL_CAPACITY_EXHAUSTED",
+                    "domain": "cloudcode-pa.googleapis.com"
+                }]
+            }
+        }"#;
+        
+        let info = tracker.parse_from_error("acc_capacity", 429, None, body).unwrap();
+        
+        // 期望：被判定为 ModelCapacityExhausted (15s)
+        assert_eq!(info.reason, RateLimitReason::ModelCapacityExhausted);
+        assert_eq!(info.retry_after_sec, 15);
+    }
+
+    #[test]
+    fn test_exponential_backoff() {
+        let tracker = RateLimitTracker::new();
+        let body = r#"{"error": {"details": [{"reason": "QUOTA_EXHAUSTED"}]}}"#;
+        
+        // 第1次失败：60秒
+        let info1 = tracker.parse_from_error("acc_backoff", 429, None, body).unwrap();
+        assert_eq!(info1.retry_after_sec, 60);
+        
+        // 清除限流记录以便再次测试（但保留失败计数）
+        tracker.limits.remove("acc_backoff");
+        
+        // 第2次连续失败：5分钟 (300秒)
+        let info2 = tracker.parse_from_error("acc_backoff", 429, None, body).unwrap();
+        assert_eq!(info2.retry_after_sec, 300);
+        
+        tracker.limits.remove("acc_backoff");
+        
+        // 第3次连续失败：30分钟 (1800秒)
+        let info3 = tracker.parse_from_error("acc_backoff", 429, None, body).unwrap();
+        assert_eq!(info3.retry_after_sec, 1800);
+        
+        tracker.limits.remove("acc_backoff");
+        
+        // 第4次连续失败：2小时 (7200秒)
+        let info4 = tracker.parse_from_error("acc_backoff", 429, None, body).unwrap();
+        assert_eq!(info4.retry_after_sec, 7200);
+        
+        // 成功后重置
+        tracker.mark_success("acc_backoff");
+        
+        // 再次失败应该回到60秒
+        let info5 = tracker.parse_from_error("acc_backoff", 429, None, body).unwrap();
+        assert_eq!(info5.retry_after_sec, 60);
+    }
+
+    #[test]
+    fn test_precise_lockout_iso_time() {
+        let tracker = RateLimitTracker::new();
+        
+        // 使用未来 5 分钟的时间进行测试
+        let future_time = chrono::Utc::now() + chrono::Duration::minutes(5);
+        let iso_time = future_time.to_rfc3339();
+        
+        // 使用 ISO 8601 时间精确锁定
+        let success = tracker.set_lockout_until_iso(
+            "acc_precise",
+            &iso_time,
+            RateLimitReason::QuotaExhausted
+        );
+        
+        assert!(success, "应该成功解析 ISO 时间");
+        assert!(tracker.is_rate_limited("acc_precise"), "账号应该处于限流状态");
+        
+        // 验证剩余时间大约在 5 分钟左右（允许几秒误差）
+        let remaining = tracker.get_remaining_wait("acc_precise");
+        assert!(remaining >= 295 && remaining <= 305, "剩余时间应该接近 5 分钟，实际: {}", remaining);
     }
 }
